@@ -1050,8 +1050,14 @@ static __global__ void mul_mat_q(
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         const int zt = tmp2.y;
+#if defined(GCN)
+        // GCN: row tiles innermost, see launch_mul_mat_q.
+        const int jt = blockIdx.y;
+        const int it = blockIdx.x;
+#else
         const int jt = blockIdx.x;
         const int it = blockIdx.y;
+#endif // defined(GCN)
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1473,7 +1479,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
     // Column tiles innermost so that the concurrently running blocks share the same tile of x and read it from L2.
-    const dim3 block_nums_xy_tiling(ntx, nty, ntzw);
+    // On GCN (gfx906) this order costs ~30% of prompt processing, so there the row tiles stay innermost.
+    const bool rows_innermost = GGML_CUDA_CC_IS_GCN(cc);
+    const dim3 block_nums_xy_tiling = rows_innermost ? dim3(nty, ntx, ntzw) : dim3(ntx, nty, ntzw);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
     GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
@@ -1488,7 +1496,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (has_fusion || !config.stream_k) {
-        GGML_ASSERT(nty <= 65535); // gridDim.y limit
+        GGML_ASSERT((rows_innermost ? ntx : nty) <= 65535); // gridDim.y limit
         mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
